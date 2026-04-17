@@ -1,9 +1,15 @@
 // ProjectileLib.cs
-// All P/Invoke bindings to the Rust cdylib.
-// DllImport name "projectile_core" resolves to:
+// All P/Invoke bindings to the Rust cdylib / staticlib.
+//
+// DllImport name resolution:
 //   macOS   → libprojectile_core.dylib
 //   Windows → projectile_core.dll
 //   Linux   → libprojectile_core.so
+//   Android → libprojectile_core.so  (inside APK/AAB)
+//   iOS     → __Internal             (static lib linked into app binary)
+//
+// On iOS, IL2CPP requires the symbol "__Internal" for static libs.
+// The preprocessor directive below switches at compile time.
 
 using System;
 using System.Runtime.InteropServices;
@@ -13,13 +19,17 @@ namespace MidManStudio.Projectiles
 {
     public static class ProjectileLib
     {
+#if UNITY_IOS && !UNITY_EDITOR
+        private const string DLL = "__Internal";
+#else
         private const string DLL = "projectile_core";
+#endif
 
         // ── Core tick ─────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Advance entire simulation by dt. Returns number of projectiles
-        /// that died this tick (for C# to recycle trail slots).
+        /// Advance entire simulation by dt seconds.
+        /// Returns number of projectiles that died this tick.
         /// </summary>
         [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
         public static extern int tick_projectiles(
@@ -30,9 +40,6 @@ namespace MidManStudio.Projectiles
 
         // ── Collision ─────────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Broad-phase + narrow-phase collision. Writes HitResults into outHits.
-        /// </summary>
         [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
         public static extern void check_hits_grid(
             IntPtr projs,
@@ -46,9 +53,6 @@ namespace MidManStudio.Projectiles
 
         // ── Spawn ─────────────────────────────────────────────────────────────
 
-        /// <summary>
-        /// Generate a pattern into outProjs. Returns number written.
-        /// </summary>
         [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
         public static extern void spawn_pattern(
             IntPtr req,
@@ -59,7 +63,6 @@ namespace MidManStudio.Projectiles
 
         // ── State ─────────────────────────────────────────────────────────────
 
-        /// <summary>Save snapshot. Returns bytes written, 0 if buf too small.</summary>
         [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
         public static extern int save_state(
             IntPtr projs,
@@ -68,7 +71,6 @@ namespace MidManStudio.Projectiles
             int    bufLen
         );
 
-        /// <summary>Restore snapshot into outProjs.</summary>
         [DllImport(DLL, CallingConvention = CallingConvention.Cdecl)]
         public static extern void restore_state(
             IntPtr outProjs,
@@ -78,26 +80,54 @@ namespace MidManStudio.Projectiles
             out int outCount
         );
 
-        // ── Sanity check ──────────────────────────────────────────────────────
+        // ── Struct size validation ─────────────────────────────────────────────
 
-        /// <summary>
-        /// Call this once on startup to validate the struct layout matches.
-        /// Logs an error if sizes disagree.
-        /// </summary>
-        public static void ValidateStructSizes()
+        public static bool ValidateStructSizes()
         {
-            int csharpSize = Marshal.SizeOf<NativeProjectile>();
-            if (csharpSize != 72)
+            bool ok = true;
+
+            int projSize = Marshal.SizeOf<NativeProjectile>();
+            if (projSize != 72)
             {
                 Debug.LogError(
-                    $"[ProjectileLib] NativeProjectile size mismatch! " +
-                    $"C# reports {csharpSize} bytes, expected 72. " +
-                    $"P/Invoke will corrupt memory. Check field offsets.");
+                    $"[ProjectileLib] NativeProjectile size mismatch: " +
+                    $"C#={projSize} bytes, expected 72. P/Invoke WILL corrupt memory.");
+                ok = false;
             }
-            else
+
+            int hitSize = Marshal.SizeOf<HitResult>();
+            if (hitSize != 24)
             {
-                Debug.Log("[ProjectileLib] Struct size OK: 72 bytes");
+                Debug.LogError(
+                    $"[ProjectileLib] HitResult size mismatch: " +
+                    $"C#={hitSize} bytes, expected 24.");
+                ok = false;
             }
+
+            int targetSize = Marshal.SizeOf<CollisionTarget>();
+            if (targetSize != 20)
+            {
+                Debug.LogError(
+                    $"[ProjectileLib] CollisionTarget size mismatch: " +
+                    $"C#={targetSize} bytes, expected 20.");
+                ok = false;
+            }
+
+            int reqSize = Marshal.SizeOf<SpawnRequest>();
+            if (reqSize != 32)
+            {
+                Debug.LogError(
+                    $"[ProjectileLib] SpawnRequest size mismatch: " +
+                    $"C#={reqSize} bytes, expected 32. " +
+                    $"Patterns will use garbage seeds — check field offsets.");
+                ok = false;
+            }
+
+            if (ok)
+                Debug.Log("[ProjectileLib] All struct sizes OK: " +
+                          "NativeProjectile=72 HitResult=24 CollisionTarget=20 SpawnRequest=32");
+
+            return ok;
         }
     }
 }
