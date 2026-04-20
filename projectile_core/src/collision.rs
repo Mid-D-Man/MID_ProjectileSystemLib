@@ -1,152 +1,207 @@
 // collision.rs — spatial grid broad-phase, circle-circle narrow-phase
 //
-// Algorithm: sorted flat-array grid, zero heap allocation.
+// STRATEGY: Index targets (few, <=128) into a spatial hash grid.
+//           For each alive projectile (many, <=2048) look up only the
+//           1-4 cells it touches and narrow-phase against those targets.
 //
-//   Build phase:
-//     For each active target insert one Entry{cell_key, ti} per cell it overlaps.
-//     Sort the flat array by cell_key. O(T log T), T ≤ 128.
+// Complexity: O(P * k)  where k = avg targets per projectile neighbourhood.
+//             At 2048 projs x 64 targets in a 200-unit world, the grid
+//             typically reduces checks by 40-60x vs the old O(P*T) scan.
 //
-//   Query phase (per projectile):
-//     Compute the cell footprint of the projectile (usually 1–2 cells).
-//     Binary-search the sorted array for each cell, iterate the run.
-//     Use a u128 bitset to skip targets already tested (handles targets that
-//     span multiple cells appearing in more than one of the projectile's cells).
-//
-//   Performance vs old O(P×T) brute-force (2048 projs × 64 targets):
-//     Before : ~131 072 distance tests, ~453 µs
-//     After  : ~4 000–8 000 distance tests, target < 20 µs
-//
-// CELL_SIZE tuning:
-//   Set to ≥ 2 × max_target_radius so most targets fit in a single cell.
-//   Default 4.0 is good for targets with radius ≤ 2.0 world units.
-//
-// Hard limit: 128 targets (u128 dedup bitset + matches C# _maxTargets = 128).
+// No heap allocation in the hot path: the grid uses a fixed inline bucket
+// array (GRID_BUCKETS slots, open-addressing) so the function is alloc-free.
 
 use crate::{NativeProjectile, CollisionTarget, HitResult};
 
-const CELL_SIZE: f32 = 4.0;
+// ── Grid tunables ─────────────────────────────────────────────────────────────
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+/// Number of hash buckets. MUST be a power of two.
+const GRID_BUCKETS: usize = 256;
 
-#[inline(always)]
-fn cell_coord(v: f32) -> i16 {
-    let c = (v / CELL_SIZE).floor() as i32;
-    c.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+/// Sentinel meaning "empty bucket".
+const EMPTY: u32 = u32::MAX;
+
+/// Max target entries stored per bucket before the cell silently overflows.
+/// With 64 targets and 256 buckets this is almost never > 2 in practice.
+/// Increase if you run many tightly-clustered targets.
+const BUCKET_ENTRIES: usize = 8;
+
+// ── Inline open-addressing spatial hash map ───────────────────────────────────
+//
+// Maps packed (cell_x, cell_y) -> list of target indices (stored as u8).
+// Avoids Vec / HashMap and keeps the struct on the stack (~6 KB at these sizes).
+
+struct CellGrid {
+    keys:    [u32; GRID_BUCKETS],
+    counts:  [u8;  GRID_BUCKETS],
+    entries: [[u8; BUCKET_ENTRIES]; GRID_BUCKETS],
 }
 
-#[inline(always)]
-fn pack_cell(cx: i16, cy: i16) -> u32 {
-    ((cx as u16 as u32) << 16) | (cy as u16 as u32)
+impl CellGrid {
+    #[inline(always)]
+    fn new() -> Self {
+        // SAFETY: all-zeros is valid for [u32; N], [u8; N], [[u8; N]; M].
+        // Using unsafe zeroed() instead of Default::default() avoids the
+        // compiler emitting a slow 6 KB memcpy from a static init table.
+        unsafe { core::mem::zeroed::<Self>() }.with_empty_keys()
+    }
+
+    // Separate step so zeroed() stays a single call.
+    fn with_empty_keys(mut self) -> Self {
+        for k in self.keys.iter_mut() { *k = EMPTY; }
+        self
+    }
+
+    /// Pack (cx, cy) pair into a u32 key.
+    /// Values are clamped to i16 range — cells beyond +/-32 767 at
+    /// CELL_SIZE=4 alias, acceptable for typical game-scale maps.
+    #[inline(always)]
+    fn pack(cx: i32, cy: i32) -> u32 {
+        let x = cx.clamp(-32768, 32767) as u16 as u32;
+        let y = cy.clamp(-32768, 32767) as u16 as u32;
+        (x << 16) | y
+    }
+
+    #[inline(always)]
+    fn hash(key: u32) -> usize {
+        // Fibonacci hashing — good distribution for low-entropy spatial keys.
+        (key.wrapping_mul(0x9e37_79b9) as usize) & (GRID_BUCKETS - 1)
+    }
+
+    /// Insert `target_idx` into the bucket for cell (cx, cy).
+    /// If the bucket is full the insertion is silently dropped — increase
+    /// BUCKET_ENTRIES or GRID_BUCKETS if this becomes a problem.
+    fn insert(&mut self, cx: i32, cy: i32, target_idx: usize) {
+        debug_assert!(target_idx < 255, "target index overflows u8 — raise BUCKET_ENTRIES guard");
+        if target_idx > 254 { return; }   // guard: stored as u8
+
+        let key  = Self::pack(cx, cy);
+        let mut slot = Self::hash(key);
+
+        for _ in 0..GRID_BUCKETS {
+            if self.keys[slot] == EMPTY {
+                // Claim empty slot for this cell.
+                self.keys[slot]   = key;
+                self.counts[slot] = 0;
+            }
+
+            if self.keys[slot] == key {
+                let c = self.counts[slot] as usize;
+                if c < BUCKET_ENTRIES {
+                    self.entries[slot][c] = target_idx as u8;
+                    self.counts[slot]     = (c + 1) as u8;
+                }
+                return;
+            }
+
+            // Hash collision — probe next slot.
+            slot = (slot + 1) & (GRID_BUCKETS - 1);
+        }
+        // Grid completely full — degrade gracefully.
+    }
+
+    /// Return stored target indices for cell (cx, cy).
+    #[inline(always)]
+    fn query(&self, cx: i32, cy: i32) -> &[u8] {
+        let key  = Self::pack(cx, cy);
+        let mut slot = Self::hash(key);
+
+        for _ in 0..GRID_BUCKETS {
+            if self.keys[slot] == EMPTY  { return &[]; }
+            if self.keys[slot] == key    {
+                let c = self.counts[slot] as usize;
+                return &self.entries[slot][..c];
+            }
+            slot = (slot + 1) & (GRID_BUCKETS - 1);
+        }
+        &[]
+    }
 }
 
-// ── grid ──────────────────────────────────────────────────────────────────────
+// ── Public API ────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy)]
-struct Entry {
-    cell: u32,
-    ti:   u8,   // target index 0–127
-}
-
-// 128 targets × max 9 cells each (3×3 when radius ≈ CELL_SIZE) = 1152.
-// 1152 × 5 bytes ≈ 6 KB stack — well within limits.
-const MAX_ENTRIES: usize = 1152;
-
-// ── public API ────────────────────────────────────────────────────────────────
-
+/// Spatial-grid projectile-target collision check.
+///
+/// `cell_size` — world units per grid cell.  Pass 0.0 to use the default (4.0).
+///   Rule of thumb: set to 2x the largest target radius.  Too small = many cells
+///   per target, more inserts.  Too large = many targets per cell, more narrow checks.
 pub fn check_hits(
-    projs:   &[NativeProjectile],
-    targets: &[CollisionTarget],
-    out:     &mut [HitResult],
+    projs:     &[NativeProjectile],
+    targets:   &[CollisionTarget],
+    out:       &mut [HitResult],
+    cell_size: f32,
 ) -> usize {
-    if projs.is_empty() || targets.is_empty() {
+    let cell     = if cell_size > 0.0 { cell_size } else { 4.0 };
+    let inv      = 1.0 / cell;
+    let max_hits = out.len();
+
+    if targets.is_empty() || projs.is_empty() || max_hits == 0 {
         return 0;
     }
 
-    // ── Step 1: build the sorted grid ─────────────────────────────────────
-    let mut buf   = [Entry { cell: 0, ti: 0 }; MAX_ENTRIES];
-    let mut n_ent = 0usize;
+    // ── Phase 1: insert active targets into the grid ──────────────────────────
+    // Each target is inserted into every cell it overlaps.
+    // A target with radius 1.0 and cell_size 4.0 typically touches 1 cell.
+    // Worst case (radius >= cell_size) is 4 cells for a 2D circle.
+
+    let mut grid = CellGrid::new();
 
     for (ti, t) in targets.iter().enumerate() {
         if t.active == 0 { continue; }
-        if ti >= 128     { break; }        // hard cap
 
-        let min_cx = cell_coord(t.x - t.radius);
-        let max_cx = cell_coord(t.x + t.radius);
-        let min_cy = cell_coord(t.y - t.radius);
-        let max_cy = cell_coord(t.y + t.radius);
+        let min_cx = ((t.x - t.radius) * inv).floor() as i32;
+        let max_cx = ((t.x + t.radius) * inv).floor() as i32;
+        let min_cy = ((t.y - t.radius) * inv).floor() as i32;
+        let max_cy = ((t.y + t.radius) * inv).floor() as i32;
 
-        let mut cx = min_cx;
-        loop {
-            let mut cy = min_cy;
-            loop {
-                if n_ent < MAX_ENTRIES {
-                    buf[n_ent] = Entry { cell: pack_cell(cx, cy), ti: ti as u8 };
-                    n_ent += 1;
-                }
-                if cy == max_cy { break; }
-                cy += 1;
+        for cx in min_cx..=max_cx {
+            for cy in min_cy..=max_cy {
+                grid.insert(cx, cy, ti);
             }
-            if cx == max_cx { break; }
-            cx += 1;
         }
     }
 
-    // Sort by cell key — binary-search requires sorted order.
-    // 1152 entries: sort_unstable ≈ 2–4 µs.
-    buf[..n_ent].sort_unstable_by_key(|e| e.cell);
+    // ── Phase 2: for each alive projectile, query its cells ───────────────────
+    // Typical projectile radius is 0.05-0.15 world units, so it almost always
+    // falls within a single cell (min_cx == max_cx and min_cy == max_cy).
 
-    // ── Step 2: per-projectile queries ────────────────────────────────────
     let mut hit_count = 0usize;
-    let max_hits      = out.len();
-    let mut checked: u128;
 
-    for (pi, p) in projs.iter().enumerate() {
-        if p.alive == 0          { continue; }
+    'proj: for (pi, p) in projs.iter().enumerate() {
+        if p.alive == 0     { continue; }
         if hit_count >= max_hits { break;    }
 
         let proj_r = p.scale_x * 0.5;
+        let min_cx = ((p.x - proj_r) * inv).floor() as i32;
+        let max_cx = ((p.x + proj_r) * inv).floor() as i32;
+        let min_cy = ((p.y - proj_r) * inv).floor() as i32;
+        let max_cy = ((p.y + proj_r) * inv).floor() as i32;
 
-        let min_cx = cell_coord(p.x - proj_r);
-        let max_cx = cell_coord(p.x + proj_r);
-        let min_cy = cell_coord(p.y - proj_r);
-        let max_cy = cell_coord(p.y + proj_r);
-
-        checked = 0u128;
-
-        'outer: for cx in min_cx..=max_cx {
+        for cx in min_cx..=max_cx {
             for cy in min_cy..=max_cy {
-                let key   = pack_cell(cx, cy);
-                let start = first_index_of(&buf[..n_ent], key);
+                for &ti_u8 in grid.query(cx, cy) {
+                    // SAFETY: target_idx was bounds-checked on insert (<= 254).
+                    let t = unsafe { targets.get_unchecked(ti_u8 as usize) };
 
-                let mut j = start;
-                while j < n_ent && buf[j].cell == key {
-                    let ti  = buf[j].ti;
-                    let bit = 1u128 << ti;
+                    let dx       = p.x - t.x;
+                    let dy       = p.y - t.y;
+                    let combined = proj_r + t.radius;
 
-                    if checked & bit == 0 {
-                        checked |= bit;
-
-                        // SAFETY: ti < 128 ≤ targets.len() (enforced at insert)
-                        let t = unsafe { targets.get_unchecked(ti as usize) };
-
-                        let dx       = p.x - t.x;
-                        let dy       = p.y - t.y;
-                        let combined = proj_r + t.radius;
-
-                        if dx * dx + dy * dy <= combined * combined {
-                            out[hit_count] = HitResult {
-                                proj_id:     p.proj_id,
-                                proj_index:  pi as u32,
-                                target_id:   t.target_id,
-                                travel_dist: p.travel_dist,
-                                hit_x:       p.x,
-                                hit_y:       p.y,
-                            };
-                            hit_count += 1;
-                            break 'outer; // one hit per projectile per tick
-                        }
+                    if dx * dx + dy * dy <= combined * combined {
+                        out[hit_count] = HitResult {
+                            proj_id:     p.proj_id,
+                            proj_index:  pi as u32,
+                            target_id:   t.target_id,
+                            travel_dist: p.travel_dist,
+                            hit_x:       p.x,
+                            hit_y:       p.y,
+                        };
+                        hit_count += 1;
+                        // One hit per projectile per tick.
+                        // Piercing logic lives in C# — it can call us again
+                        // with the hit projectile's alive flag cleared.
+                        continue 'proj;
                     }
-                    j += 1;
                 }
             }
         }
@@ -155,14 +210,20 @@ pub fn check_hits(
     hit_count
 }
 
-// Returns the index of the first entry with entry.cell == key, or n if none.
-#[inline]
-fn first_index_of(entries: &[Entry], key: u32) -> usize {
-    let mut lo = 0usize;
-    let mut hi = entries.len();
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if entries[mid].cell < key { lo = mid + 1; } else { hi = mid; }
-    }
-    lo
-}
+// ── Performance notes ─────────────────────────────────────────────────────────
+//
+// Benchmark targets at 2048 projs x 64 targets:
+//   Old O(P*T) brute-force : ~450 us/check  (131 072 distance tests)
+//   Grid O(P*k)            : target <50 us  (~2048 x 1-3 tests at 4.0 cell)
+//
+// Tuning guide:
+//   - cell_size = 4.0 fits most 2D games with target radii of 0.5-2.0 units.
+//   - If steady-state target count exceeds 128, raise GRID_BUCKETS to 512.
+//   - If targets cluster (e.g. dense enemy groups), lower cell_size to 2.0
+//     so they spread across more buckets.
+//
+// 3D extension:
+//   - Add z / vz fields to NativeProjectile.
+//   - Change distance test to: dx*dx + dy*dy + dz*dz <= combined*combined
+//   - Change pack() to combine cx/cy/cz — store in u64, adjust hash.
+//   - GRID_BUCKETS may need to increase (more spatial spread in 3D).
