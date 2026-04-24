@@ -160,27 +160,28 @@ public bool IsRaycastWeapon;
         // ─────────────────────────────────────────────────────────────────────
 
         private static SimulationMode ComputeMode(
-            ProjectileConfigScriptableObject config,
-            WeaponFireContext context)
-        {
-            // Physics-dependent types always go to PhysicsObject regardless of fire rate.
-            // These use Unity Rigidbody2D/3D via ObjectNetSync, not the Rust sim buffer.
-            if (RequiresPhysicsObject(config))
-                return SimulationMode.PhysicsObject;
+    ProjectileConfigScriptableObject config,
+    WeaponFireContext context)
+{
+    // Physics-dependent types use Unity Rigidbody — not the Rust sim buffer.
+    if (RequiresPhysicsObject(config))
+        return SimulationMode.PhysicsObject;
 
-            // High fire rate basic projectiles → instant hitscan (Raycast).
-            // Raycast is only valid when the projectile config is eligible:
-            //   no piercing, no special physics, no exotic movement.
-            if (context.FireRate >= RaycastFireRateThreshold && IsRaycastEligible(config))
-                return SimulationMode.Raycast;
+    // Raycast mode: the WEAPON does the Physics2D.Raycast in its own fire method.
+    // This flag tells MID_MasterProjectileSystem: don't spawn a sim projectile,
+    // just route to RaycastProjectileHandler for visual + RPC handling.
+    // The weapon must call MID_MasterProjectileSystem.RegisterRaycastHit() with
+    // the result — it does NOT fire the ray itself.
+    if (context.IsRaycastWeapon && IsRaycastEligible(config))
+        return SimulationMode.Raycast;
 
-            // 3D sim path
-            if (config.get_Is3D)
-                return SimulationMode.RustSim3D;
+    // 3D sim path
+    if (config.Is3D)
+        return SimulationMode.RustSim3D;
 
-            // Default: 2D Rust simulation
-            return SimulationMode.RustSim2D;
-        }
+    // Default: 2D Rust simulation
+    return SimulationMode.RustSim2D;
+}
 
         // ─────────────────────────────────────────────────────────────────────
         //  Eligibility checks
