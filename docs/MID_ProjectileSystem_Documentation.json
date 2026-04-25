@@ -1,0 +1,388 @@
+{
+  "system": "MID_ProjectileSystem",
+  "version": "2.0",
+  "date": "2026-04-25",
+  "authors": ["Abdulhamid Manman Suleiman", "MidMan Studio"],
+
+  "overview": {
+    "summary": "High-performance server-authoritative projectile system for Unity NGO. Rust owns simulation and collision. C# owns damage, visuals, networking, and game logic. Pattern library is C#-extensible. Movement types live in Rust but are configured from C# per-config.",
+    "key_files": {
+      "entry_point":       "MID_MasterProjectileSystem.cs",
+      "rust_lib":          "projectile_core/src/lib.rs",
+      "config":            "ProjectileConfigSO.cs",
+      "pattern":           "ProjectilePatternSO.cs",
+      "registry":          "ProjectileRegistry.cs",
+      "server_sim":        "ServerProjectileAuthority.cs",
+      "damage_adapter":    "RustSimAdapter.cs",
+      "network_rpcs":      "MID_ProjectileNetworkBridge.cs",
+      "client_prediction": "ClientPredictionManager.cs",
+      "offline_manager":   "LocalProjectileManager.cs",
+      "raycast_handler":   "RaycastProjectileHandler.cs",
+      "spawn_helper":      "BatchSpawnHelper.cs",
+      "type_router":       "ProjectileTypeRouter.cs"
+    }
+  },
+
+  "architecture": {
+    "who_owns_what": {
+      "Rust":    ["physics tick", "spatial grid collision", "wave/circular param store", "state save/restore", "batch spawn copy"],
+      "Burst":   ["parallel struct fill for 8+ simultaneous spawns only"],
+      "C#":      ["damage curves", "damage computation", "RPCs", "visual routing", "prediction", "reconciliation", "pattern geometry", "trail", "impact effects", "game logic"]
+    },
+    "simulation_modes": {
+      "LocalOnly":     "Offline/practice. Rust sim, no NGO. LocalProjectileManager owns everything.",
+      "RustSim2D":     "Server runs Rust 2D tick. Clients predict with origin+dir*speed*t. Snapshots reconcile.",
+      "RustSim3D":     "Server runs Rust 3D tick. Identical architecture to 2D.",
+      "Raycast":       "WEAPON script owns Physics2D.Raycast. System handles visual + RPC only.",
+      "PhysicsObject": "Unity Rigidbody2D/3D via ObjectNetSync. Low spawn rate only (rockets, grenades)."
+    },
+    "routing_priority": [
+      "1. config.HasSimModeOverride wins always",
+      "2. RequiresPhysicsObject (rocket/fireball/bouncy/sticky/exploder) → PhysicsObject",
+      "3. context.IsRaycastWeapon AND IsRaycastEligible → Raycast",
+      "4. config.Is3D → RustSim3D",
+      "5. Default → RustSim2D",
+      "6. !context.IsNetworked → LocalOnly (checked first, overrides all)"
+    ]
+  },
+
+  "rust_structs": {
+    "NativeProjectile_2D": {
+      "size_bytes": 72,
+      "fields": "x,y,vx,vy,ax,ay,angle_deg,curve_t | scale_x,scale_y,scale_target,scale_speed | lifetime,max_lifetime,travel_dist | config_id,owner_id,proj_id | collision_count,movement_type,piercing_type,alive"
+    },
+    "NativeProjectile_3D": {
+      "size_bytes": 84,
+      "fields": "x,y,z,vx,vy,vz,ax,ay,az | scale_x,scale_y,scale_z,scale_target,scale_speed | lifetime,max_lifetime,travel_dist,timer_t | config_id,owner_id,proj_id | collision_count,movement_type,piercing_type,alive",
+      "vs_2D": "adds Z components + scale_z. timer_t replaces curve_t. angle_deg removed (C# derives from velocity)."
+    },
+    "HitResult_2D":         { "size_bytes": 24 },
+    "HitResult_3D":         { "size_bytes": 28 },
+    "CollisionTarget_2D":   { "size_bytes": 20 },
+    "CollisionTarget_3D":   { "size_bytes": 24 },
+    "SpawnRequest":         { "size_bytes": 32 }
+  },
+
+  "movement_types": {
+    "note": "Shooting mode (burst/auto/single/shotgun) is a WEAPON property. Movement type is a physics property assigned per projectile config.",
+    "types": {
+      "Straight":  { "byte": 0, "description": "Constant velocity + optional linear accel. Most performant. Default for all guns." },
+      "Arching":   { "byte": 1, "description": "Same as straight but timer_t advances. Use GravityScale for parabolic arc. Arrows, mortars." },
+      "Guided":    { "byte": 2, "description": "Turns toward ax/ay(/az) each tick. C# writes target direction via TickDispatcher Tick_0_1. Homing missiles." },
+      "Teleport":  { "byte": 3, "description": "Discrete jumps every 0.12s. Not interpolated. Blink/phase projectiles." },
+      "Wave":      { "byte": 4, "description": "Sinusoidal lateral oscillation. Params stored Rust-side via register_wave_params(). ax/ay = perp axis set at spawn." },
+      "Circular":  { "byte": 5, "description": "Helical orbit around travel axis. Params stored Rust-side via register_circular_params(). ax/ay(/az) = first perp axis set at spawn." }
+    },
+    "extensibility": {
+      "adding_new_type": "Add byte constant in simulation.rs match arm. Add tick fn. Update C# ProjectileMovementType enum. CI builds new native lib automatically.",
+      "without_new_type": "For sine/spiral/custom paths: use Straight + C# TickDispatcher subscriber writing ax/ay each Tick_0_1. No Rust changes needed."
+    },
+    "wave_circular_config_store": {
+      "why": "These movement types need per-config constants (amplitude, frequency, radius, angular_speed) read every tick inside the hot loop. Storing per-projectile adds 8-16 bytes to ALL projectiles, bloating cache lines for 95% that don't use these types.",
+      "how": "Rust-side HashMap<u16, WaveParams> and HashMap<u16, CircularParams>. Registered once at startup via ProjectileLib.register_wave_params() / register_circular_params().",
+      "registration": "ProjectileConfigSO.RegisterMovementParams() is called automatically by ProjectileRegistry.Register(). No manual call needed.",
+      "not_a_general_store": "ONLY wave and circular params are stored Rust-side. All other config data stays C# only."
+    }
+  },
+
+  "damage_system": {
+    "model": "AnimationCurve over normalised travel distance (0 = spawn, 1 = MaxRange). Flat curve = constant damage, zero evaluation overhead.",
+    "fields": {
+      "DamageCurve":        "AnimationCurve — damage at each distance",
+      "HeadshotMultiplier": "float — multiplied on headshot",
+      "CritChance":         "float 0-1 — probability of crit per projectile",
+      "CritMultiplier":     "float — damage multiplier when crit rolls"
+    },
+    "crit_timing": "Pre-rolled per projectile at spawn time by ServerProjectileAuthority. Stored as isCrit bool in ServerProjectileData. Applied in RustSimAdapter.ComputeDamage().",
+    "no_min_max": "Min/max random damage is replaced by AnimationCurve. If curve is flat (all keys same value), IsDamageConstant() returns true and callers can skip Evaluate().",
+    "distance_source": "HitResult.TravelDist comes from Rust (NativeProjectile.travel_dist accumulated each tick). Never computed in C#."
+  },
+
+  "id_system": {
+    "ProjId": {
+      "type": "uint",
+      "online": "Monotonically increasing counter in ServerProjectileAuthority. Allocated via AllocateProjIds(count).",
+      "offline": "Same counter in LocalProjectileManager. Process-local only."
+    },
+    "TargetId": {
+      "type": "uint",
+      "online": "(uint)NetworkObject.NetworkObjectId — unique across session",
+      "offline": "(uint)gameObject.GetInstanceID() — process-unique. No NGO."
+    },
+    "OwnerMidId": {
+      "type": "ulong",
+      "players": "Equals NGO OwnerClientId for human players",
+      "bots": "Stable 100-999 range ID assigned at bot spawn. NOT the server's NGO ID (0).",
+      "why": "If bots used OwnerClientId (0 = server), kill attribution and damage type resolution would incorrectly route through server-player logic."
+    },
+    "ConfigId": {
+      "type": "ushort",
+      "assigned_by": "ProjectileRegistry at registration. Session-stable. Not persistent across sessions."
+    }
+  },
+
+  "pattern_system": {
+    "architecture": "C#-only. No Rust involvement. Weapon fires BatchSpawnHelper with pre-computed SpawnPoint[].",
+    "ProjectilePatternSO": {
+      "spline_types": ["CatmullRom (recommended — passes through all points)", "Bezier (precise handle control)"],
+      "fields": ["ControlPoints: Vector2[] in local weapon space (X=horizontal deg, Y=vertical deg)", "ProjectileCount: how many bullets sample the spline", "SpeedVariance: ±variance per pellet, deterministic with RngSeed"],
+      "editor": "ProjectilePatternEditor.cs — interactive spline viewport, drag points, simulate gizmo in scene view"
+    },
+    "adding_custom_patterns": "Add a static method to BatchSpawnHelper or a companion PatternLibrary class. Compute SpawnPoint[], pass to BatchSpawnHelper.SpawnBatch2D/3D(). No Rust changes needed."
+  },
+
+  "config_extensibility": {
+    "core_package_config": "ProjectileConfigSO.cs — lean, game-agnostic. Contains only: simulation routing, movement, piercing, scale growth, damage curve, visual, trail, impact.",
+    "game_specific_extension": {
+      "pattern": "Derive from ProjectileConfigSO in your game assembly.",
+      "example": "public class MID_ProjectileConfig : ProjectileConfigSO { public LegendaryTier tier; public AudioClip flightSound; }",
+      "note": "All package systems (BatchSpawnHelper, TrailObjectPool, ProjectileRegistry) reference ProjectileConfigSO only — derived class slots in transparently."
+    },
+    "removed_from_core": ["legendary/runic tiers", "kill effects", "extra item types (audio/particles per-collision)", "explosion force/radius (PhysicsObject handles this)", "ProjectileType enum (rocket/fireball → SimulationMode.PhysicsObject)"]
+  },
+
+  "network_model": {
+    "server_authoritative": true,
+    "client_prediction": {
+      "model": "Deterministic extrapolation: position = origin + direction * speed * elapsed. Matches Rust Straight tick exactly.",
+      "history_buffer": "CircularBuffer<ProjectileStatePayload> per projectile. Stores predicted position at each server tick.",
+      "accuracy": "Exact for Straight. Approximate for Arching/Guided — snapshots correct drift."
+    },
+    "reconciliation": {
+      "threshold": "If server snapshot differs from predicted by > reconcileThreshold (0.5m default) → smooth lerp over reconcileDuration (0.15s).",
+      "hard_snap": "If error > hardSnapThreshold (3m default) → instant position snap + origin correction.",
+      "snapshot_rate": "Every 3-5 FixedUpdates (not every frame). Coarse correction only."
+    },
+    "latency_compensation": {
+      "method": "Server computes RTT from clientFireTick vs serverTick. Offsets spawn position by dir * speed * latency. Applied once at spawn.",
+      "clamped": "Max 500ms compensation to prevent exploitation."
+    },
+    "what_is_synced": [
+      "SpawnConfirmedClientRpc: configId, origin, dir, speed, baseId, serverTick",
+      "HitConfirmedClientRpc: projId, targetId, damage, hitPos, isHeadshot, isCrit",
+      "SnapshotClientRpc: (projId, x, y[, z]) array every N ticks"
+    ],
+    "what_is_NOT_synced": [
+      "Projectile position every frame (no NetworkTransform on bullets)",
+      "Physics state per tick",
+      "Damage values in transit (computed server-side only)",
+      "Projectile array or count"
+    ]
+  },
+
+  "files_changed": {
+    "rust_updated": [
+      { "file": "projectile_core/src/lib.rs",        "changes": "Added NativeProjectile3D(84B), HitResult3D(28B), CollisionTarget3D(24B). Added tick_projectiles_3d, check_hits_grid_3d, spawn_batch, spawn_batch_3d, register_wave_params, register_circular_params, movement type constant exports, compile-time size assertions." },
+      { "file": "projectile_core/src/simulation.rs",  "changes": "Added MOVE_WAVE(4) and MOVE_CIRCULAR(5) constants. Added tick_wave, tick_circular for 2D. Added full 3D tick: tick_all_3d, tick_straight_3d, tick_arching_3d, tick_guided_3d, tick_teleport_3d, tick_wave_3d, tick_circular_3d, tick_scale_3d." },
+      { "file": "projectile_core/src/collision.rs",   "changes": "Added CellGrid3D (512 buckets, u64 keys). Added check_hits_3d with 3D sphere-sphere narrow phase. 2D collision unchanged." },
+      { "file": "projectile_core/src/config_store.rs","changes": "NEW FILE. Rust-side HashMap stores for WaveParams and CircularParams indexed by config_id u16. RwLock for thread safety. get_wave/get_circular called from simulation hot loop." },
+      { "file": "projectile_core/Cargo.toml",         "changes": "Added lazy_static = '1.5' dependency for config_store." }
+    ],
+    "csharp_new": [
+      "SimulationMode.cs",
+      "NativeProjectile3D.cs (+ HitResult3D, CollisionTarget3D)",
+      "ProjectileConfigSO.cs (lean core rewrite)",
+      "ProjectileTypeRouter.cs",
+      "BatchSpawnHelper.cs (+ BurstFill2DJob, BurstFill3DJob)",
+      "ProjectilePatternSO.cs",
+      "ProjectilePatternEditor.cs",
+      "ProjectileRegistry.cs",
+      "ServerProjectileData.cs",
+      "RustSimAdapter.cs",
+      "ServerProjectileAuthority.cs",
+      "LocalProjectileManager.cs",
+      "RaycastProjectileHandler.cs",
+      "MID_ProjectileNetworkBridge.cs",
+      "ClientPredictionManager.cs",
+      "ProjectileRenderer3D.cs",
+      "ProjectileImpactHandler.cs (+ ImpactFlipbook)",
+      "MID_MasterProjectileSystem.cs"
+    ],
+    "csharp_updated": [
+      { "file": "ProjectileLib.cs",       "changes": "Added 3D P/Invoke bindings (tick_3d, collision_3d, spawn_batch, spawn_batch_3d, movement param registration). Added ValidateStructSizes() covering all 7 structs." },
+      { "file": "TrailObjectPool.cs",     "changes": "Added SyncToSimulation(NativeProjectile3D[], int) overload. Extracted RetireExpiredFades(), FindSlot(). ApplyConfig updated for new TrailConfig fields (MinVertexDistance, CapVertices)." },
+      { "file": "ProjectileRenderer2D.cs","changes": "Minor: Render() now called by LocalProjectileManager.LateUpdate() and can receive buffer from authority client-side. No rendering logic changes." }
+    ],
+    "deprecated_when_migrated": [
+      "Projectile.cs            → replaced by ServerProjectileData + NativeProjectile",
+      "ProjectileVisual.cs      → replaced by ProjectileVisual_",
+      "UnifiedProjectileManager.cs → replaced by MID_MasterProjectileSystem",
+      "RaycastProjectileManager.cs → replaced by RaycastProjectileHandler",
+      "ServerProjectileManager.cs  → replaced by ServerProjectileAuthority + RustSimAdapter",
+      "ConsolidatedProjectileDamageHandler.cs → damage logic absorbed into RustSimAdapter"
+    ],
+    "kept_unchanged": [
+      "NativeProjectile.cs         (72B layout proven correct)",
+      "ProjectileVisual_.cs        (already optimized)",
+      "ProjectileTrailOptimizer.cs (keep as-is)",
+      "LocalObjectPool.cs",
+      "LocalParticlePool.cs",
+      "ObjectNetSync.cs            (kept for slow physics objects only)",
+      "ProjectileConfigManager.cs  (game-side O(1) cache by enum — unchanged)",
+      "MID_TickDispatcher.cs",
+      "MID_NativeTickDispatcher.cs",
+      "ProjectileShapeSO.cs",
+      "ProjectileShapeEditor.cs",
+      "BurstProjectileSimulation.cs"
+    ]
+  },
+
+  "setup_guide": {
+    "step_1_scene_setup": {
+      "description": "Create a persistent GameObject named 'ProjectileSystem'.",
+      "components_to_attach": [
+        "MID_MasterProjectileSystem",
+        "ProjectileRegistry",
+        "ServerProjectileAuthority",
+        "LocalProjectileManager",
+        "MID_ProjectileNetworkBridge",
+        "ClientPredictionManager",
+        "RaycastProjectileHandler",
+        "ProjectileImpactHandler",
+        "TrailObjectPool",
+        "ProjectileRenderer2D",
+        "ProjectileRenderer3D"
+      ]
+    },
+    "step_2_registry": {
+      "description": "Assign all ProjectileConfigSO assets to ProjectileRegistry._autoRegister in the inspector. They will be registered automatically on Awake with stable configIds.",
+      "manual_registration": "Alternatively call ProjectileRegistry.Instance.Register(cfg) at runtime."
+    },
+    "step_3_config_creation": {
+      "description": "Create ProjectileConfigSO assets via Assets > Create > MidMan > Projectile System > Projectile Config.",
+      "key_fields": {
+        "Is3D":             "Enable for 3D projectiles (uses NativeProjectile3D buffer).",
+        "MovementType":     "Straight for most weapons. Wave/Circular auto-register Rust params.",
+        "DamageCurve":      "AnimationCurve x=distance y=damage. Flat = constant damage.",
+        "UseScaleGrowth":   "Only enable if projectile grows after spawn. Default false = zero Rust cost.",
+        "HasTrail":         "Enable + assign TrailMaterial for trail renderer.",
+        "PreferredSimMode": "Override routing for special cases (e.g. force PhysicsObject)."
+      },
+      "game_specific_extension": "Derive from ProjectileConfigSO for game-specific fields (audio, legendary tier, kill effects, etc.)."
+    },
+    "step_4_pattern_creation": {
+      "description": "Create ProjectilePatternSO via Assets > Create > MidMan > Projectile System > Projectile Pattern.",
+      "editor": "Select the asset to open the interactive pattern editor. Drag control points to define shot spread shape. Preview button shows rays in Scene view.",
+      "usage_in_weapon": "Call pattern.SampleDirections() to get Vector2[] angles. Convert to world-space SpawnPoint[] at the barrel. Pass to MID_MasterProjectileSystem.Fire()."
+    },
+    "step_5_weapon_script": {
+      "description": "Weapon scripts call MID_MasterProjectileSystem. They own shooting mode logic (burst, auto, single). The system owns simulation.",
+      "rust_sim_example": [
+        "// In weapon Fire() method:",
+        "var angles = _pattern.SampleDirections(_pelletCount);",
+        "var spawnPts = new SpawnPoint[angles.Length];",
+        "for (int i = 0; i < angles.Length; i++) {",
+        "    var dir = Quaternion.Euler(0, angles[i].x, -angles[i].y) * transform.forward;",
+        "    spawnPts[i] = new SpawnPoint { Origin = barrelTip.position, Direction = dir, Speed = 0f };",
+        "}",
+        "MID_MasterProjectileSystem.Instance.Fire(_configId, spawnPts, spawnPts.Length, _context);"
+      ],
+      "raycast_example": [
+        "// Weapon owns the cast:",
+        "var hit = Physics2D.Raycast(barrelTip.position, barrelTip.right, config.MaxRange, _layers);",
+        "var result = new RaycastFireResult {",
+        "    Origin = barrelTip.position,",
+        "    Direction = barrelTip.right,",
+        "    HitPoint = hit ? hit.point : barrelTip.position + barrelTip.right * config.MaxRange,",
+        "    DidHit = hit,",
+        "    HitTargetNetworkId = hit ? hit.collider.GetComponentInParent<NetworkObject>()?.NetworkObjectId ?? 0 : 0,",
+        "    IsHeadshot = CheckHeadshot(hit)",
+        "};",
+        "MID_MasterProjectileSystem.Instance.RegisterRaycastFire(result, _configId, _context);"
+      ]
+    },
+    "step_6_target_registration": {
+      "description": "Damageable characters register themselves as collision targets.",
+      "online": [
+        "// In character FixedUpdate or TickDispatcher Tick_0_05:",
+        "MID_MasterProjectileSystem.Instance.RegisterTarget2D(new CollisionTarget {",
+        "    X = transform.position.x, Y = transform.position.y,",
+        "    Radius = _hitRadius,",
+        "    TargetId = (uint)NetworkObject.NetworkObjectId,",
+        "    Active = 1",
+        "});"
+      ],
+      "offline": [
+        "// Register LocalDamageTarget with LocalProjectileManager:",
+        "var target = new LocalDamageTarget {",
+        "    LocalId = (uint)gameObject.GetInstanceID(),",
+        "    Position = transform.position,",
+        "    Radius = _hitRadius,",
+        "    Active = true,",
+        "    SourceObject = gameObject",
+        "};",
+        "LocalProjectileManager.Instance.RegisterTarget(target);"
+      ]
+    },
+    "step_7_damage_subscription": {
+      "online": [
+        "// Game damage system subscribes to RustSimAdapter:",
+        "_authority.Adapter.OnProjectileHit += OnHit;",
+        "void OnHit(ProjectileHitPayload p) {",
+        "    var target = GetNetworkObject(p.TargetId);",
+        "    target.GetComponent<HealthComponent>().TakeDamage(p.Damage, p.IsHeadshot);",
+        "}"
+      ],
+      "offline": [
+        "// Subscribe to LocalProjectileManager:",
+        "LocalProjectileManager.Instance.OnHit += OnLocalHit;",
+        "void OnLocalHit(LocalHitPayload p) {",
+        "    p.Target.SourceObject.GetComponent<HealthComponent>().TakeDamage(p.Damage, p.IsHeadshot);",
+        "}"
+      ]
+    },
+    "step_8_guided_projectiles": {
+      "description": "For homing/guided projectiles, update the target direction via TickDispatcher.",
+      "example": [
+        "// Subscribe once on spawn:",
+        "MID_TickDispatcher.Subscribe(TickRate.Tick_0_1, UpdateHoming);",
+        "void UpdateHoming(float dt) {",
+        "    var target = FindNearestEnemy();",
+        "    if (target == null) return;",
+        "    var dir = (target.position - _projSpawnPos).normalized;",
+        "    MID_MasterProjectileSystem.Instance.SetHomingDirection2D(_projId, dir);",
+        "}"
+      ]
+    },
+    "step_9_impact_effects": {
+      "description": "Register per-config impact strategies for non-default effects.",
+      "example": [
+        "// In game setup:",
+        "ProjectileImpactHandler.Instance.RegisterStrategy(shotgunConfigId, new ImpactRegistration {",
+        "    Strategy = ImpactStrategy.SharedEmit,",
+        "    SharedSystem = _dustParticleSystem,",
+        "    EmitCount = 6,",
+        "    EmitSpeed = 2f",
+        "});"
+      ]
+    }
+  },
+
+  "performance_notes": {
+    "benchmark_results": {
+      "rust_tick_2048_projs":    "52.7µs",
+      "collision_rust_grid":     "522.8µs",
+      "continuous_fire_600_active": "0.061ms per frame",
+      "burst_batch_spawn":       "0.4µs (vs 928µs per-call for old spawn_pattern)"
+    },
+    "key_rules": [
+      "scale_speed = 0 (default) → tick_scale skipped entirely per projectile. Zero cost for non-growing bullets.",
+      "Wave/Circular params stored Rust-side → zero per-projectile struct overhead for straight/guided/teleport bullets.",
+      "spawn_batch: always one FFI call regardless of pellet count. BatchSpawnHelper uses Burst for 8+ pellets.",
+      "TrailObjectPool: applies config only on change. MinVertexDistance 0.1+ for fast projectiles.",
+      "TickDispatcher Tick_0_1: use for damage reduction over distance, guided direction updates, trail cleanup, performance monitoring.",
+      "Never use NetworkTransform or ObjectNetSync on Rust-sim projectiles.",
+      "Snapshot rate 3-5 ticks (not every frame). Snapshot is coarse error correction, not primary position sync."
+    ]
+  },
+
+  "common_mistakes": [
+    { "mistake": "Calling Fire() with Raycast mode",                    "fix": "Use RegisterRaycastFire() instead. The weapon script owns Physics2D.Raycast()." },
+    { "mistake": "Modifying NativeProjectile position in C#",          "fix": "Rust owns position. Write ax/ay for acceleration only. Never write x/y directly." },
+    { "mistake": "Using OwnerClientId for bot projectiles",            "fix": "Use MID ID (100-999 range). isBotOwner flag disambiguates. See ServerProjectileData." },
+    { "mistake": "Storing game-specific fields in ProjectileConfigSO", "fix": "Derive from ProjectileConfigSO in your game assembly. Package systems use base class only." },
+    { "mistake": "Registering configs after the first Fire() call",    "fix": "Register all configs in Awake() or before the first frame. ConfigIds must be stable." },
+    { "mistake": "Using ObjectNetSync on bullets",                     "fix": "ObjectNetSync is ONLY for slow physics objects (rockets/grenades). Never on Rust-sim bullets." },
+    { "mistake": "Subscribing to TickDispatcher Tick_0_01 for logic",  "fix": "Use Tick_0_1 minimum. Tick_0_01 has negative CPU saving below ~100fps. See MID_TickDispatcher docs." }
+  ]
+    }
